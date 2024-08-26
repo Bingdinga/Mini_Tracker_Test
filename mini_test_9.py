@@ -1,0 +1,215 @@
+import cv2
+import numpy as np
+from picamera2 import Picamera2
+import time
+import random
+import sys
+import threading
+
+class ObjectTracker:
+    def __init__(self):
+        self.objects = []
+        self.tracking = False
+        self.current_id = 0
+
+    def add_object(self, x, y, label):
+        self.objects.append({
+            'id': self.current_id,
+            'label': label,
+            'bbox': None,
+            'tracker': cv2.TrackerKCF_create()
+        })
+        self.current_id += 1
+
+    def update_label(self, object_id, new_label):
+        for obj in self.objects:
+            if obj['id'] == object_id:
+                obj['label'] = new_label
+                break
+
+    def remove_object(self, object_id):
+        self.objects = [obj for obj in self.objects if obj['id'] != object_id]
+
+def get_object_color(label):
+    hash_value = hash(label)
+    r = (hash_value & 0xFF0000) >> 16
+    g = (hash_value & 0x00FF00) >> 8
+    b = hash_value & 0x0000FF
+    return (r, g, b)
+
+def is_mini_shape(contour, min_area=500, max_area=20000, min_vertices=5):
+    area = cv2.contourArea(contour)
+    if area < min_area or area > max_area:
+        return False
+    
+    # Approximate the contour to simplify the shape
+    epsilon = 0.02 * cv2.arcLength(contour, True)
+    approx = cv2.approxPolyDP(contour, epsilon, True)
+    
+    # Check if the shape has a minimum number of vertices
+    if len(approx) < min_vertices:
+        return False
+    
+    # Check if the contour is somewhat complex (not just a simple rectangle)
+    hull = cv2.convexHull(contour)
+    hull_area = cv2.contourArea(hull)
+    solidity = float(area) / hull_area
+    if solidity > 0.95:  # Too solid, probably not a mini
+        return False
+    
+    return True
+
+def detect_minis(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 50, 150)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    mini_contours = [cnt for cnt in contours if is_mini_shape(cnt)]
+    
+    return mini_contours
+
+def draw_detected_minis(frame, contours):
+    for contour in contours:
+        # Draw the detailed contour
+        cv2.drawContours(frame, [contour], 0, (0, 255, 0), 2)
+        
+        # Draw the convex hull
+        hull = cv2.convexHull(contour)
+        cv2.drawContours(frame, [hull], 0, (255, 0, 0), 1)
+        
+        # Draw the center point of the mini
+        M = cv2.moments(contour)
+        if M["m00"] != 0:
+            cX = int(M["m10"] / M["m00"])
+            cY = int(M["m01"] / M["m00"])
+            cv2.circle(frame, (cX, cY), 3, (0, 0, 255), -1)
+
+class SmoothDetector:
+    def __init__(self, history_length=5):
+        self.history = []
+        self.history_length = history_length
+
+    def update(self, contours):
+        self.history.append(contours)
+        if len(self.history) > self.history_length:
+            self.history.pop(0)
+
+    def get_stable_contours(self):
+        if not self.history:
+            return []
+
+        stable_contours = []
+        for contour in self.history[-1]:
+            count = sum(1 for past_contours in self.history if any(self.contour_similar(contour, past_contour) for past_contour in past_contours))
+            if count >= self.history_length // 2:
+                stable_contours.append(contour)
+        return stable_contours
+
+    def contour_similar(self, contour1, contour2, threshold=0.9):
+        return cv2.matchShapes(contour1, contour2, 1, 0.0) < threshold
+
+def print_menu():
+    print("\nDnD Mini Tracker Menu:")
+    print("1. Start tracking")
+    print("2. Stop tracking")
+    print("3. Zoom in")
+    print("4. Zoom out")
+    print("5. Toggle autofocus")
+    print("6. Quit")
+    print("Enter your choice: ", end="", flush=True)
+
+def handle_input(tracker, zoom_factor, running, picam2):
+    autofocus_enabled = True
+    while running[0]:
+        print_menu()
+        choice = input().strip()
+        if choice == '1':
+            tracker.tracking = True
+            print("Tracking started")
+        elif choice == '2':
+            tracker.tracking = False
+            print("Tracking stopped")
+        elif choice == '3':
+            zoom_factor[0] = min(4.0, zoom_factor[0] + 0.1)
+            print(f"Zoomed in. Zoom factor: {zoom_factor[0]:.1f}")
+        elif choice == '4':
+            zoom_factor[0] = max(0.1, zoom_factor[0] - 0.1)
+            print(f"Zoomed out. Zoom factor: {zoom_factor[0]:.1f}")
+        elif choice == '5':
+            autofocus_enabled = not autofocus_enabled
+            if autofocus_enabled:
+                picam2.set_controls({"AfMode": 2})  # Continuous autofocus
+                print("Autofocus enabled")
+            else:
+                picam2.set_controls({"AfMode": 0})  # Manual focus
+                print("Autofocus disabled")
+        elif choice == '6':
+            running[0] = False
+            print("Quitting...")
+        else:
+            print("Invalid choice. Please try again.")
+
+def main():
+    picam2 = None
+    try:
+        picam2 = Picamera2()
+        
+        config = picam2.create_preview_configuration(main={"format": 'XRGB8888', "size": (1920, 1080)})
+        picam2.configure(config)
+        
+        picam2.set_controls({"AfMode": 2})  # Enable continuous autofocus
+        
+        picam2.start()
+        
+        time.sleep(2)  # Wait for the camera to warm up
+
+        tracker = ObjectTracker()
+        smooth_detector = SmoothDetector()
+
+        cv2.namedWindow("Tracking")
+
+        zoom_factor = [1.0]
+        running = [True]
+
+        input_thread = threading.Thread(target=handle_input, args=(tracker, zoom_factor, running, picam2))
+        input_thread.daemon = True
+        input_thread.start()
+
+        while running[0]:
+            frame = picam2.capture_array()
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2RGB)
+
+            if zoom_factor[0] != 1.0:
+                h, w = frame.shape[:2]
+                zoom_h, zoom_w = int(h / zoom_factor[0]), int(w / zoom_factor[0])
+                start_y, start_x = (h - zoom_h) // 2, (w - zoom_w) // 2
+                frame = frame[start_y:start_y+zoom_h, start_x:start_x+zoom_w]
+                frame = cv2.resize(frame, (w, h))
+
+            # Detect potential minis
+            mini_contours = detect_minis(frame)
+            
+            # Update and get stable contours
+            smooth_detector.update(mini_contours)
+            stable_contours = smooth_detector.get_stable_contours()
+            
+            # Draw detected minis
+            draw_detected_minis(frame, stable_contours)
+
+            # Resize frame for display
+            display_frame = cv2.resize(frame, (960, 540))
+            cv2.imshow("Tracking", display_frame)
+            cv2.waitKey(1)
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+    finally:
+        if picam2:
+            picam2.stop()
+        cv2.destroyAllWindows()
+        print("Script terminated. Goodbye!")
+        sys.exit(0)
+
+if __name__ == "__main__":
+    main()
